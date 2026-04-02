@@ -1,0 +1,374 @@
+
+业务系统 IP	业务系统 用户名	业务系统 密码
+199.98.2.2	root	 
+
+已有模型 qwen3.5-27b   /root/code/Qwen3.5-27B
+已有docker环境  已有docker 镜像 ，带 vllm ，vllm-ascend 代码
+
+启动镜像：
+  export IMAGE=m.daocloud.io/quay.io/ascend/vllm-ascend:nightly-releases-v0.18.0-a3
+  export NAME=vllm-a3
+
+  # Run the container using the defined variables
+  # Note: If you are running bridge network with docker, please expose available ports for multiple nodes communication in advance.
+  docker run -d --privileged \
+  --name $NAME \
+  --net=host \
+  --shm-size=1g \
+  --device /dev/davinci0 \
+  --device /dev/davinci1 \
+  --device /dev/davinci2 \
+  --device /dev/davinci3 \
+  --device /dev/davinci_manager \
+  --device /dev/devmm_svm \
+  --device /dev/hisi_hdc \
+  -v /usr/local/dcmi:/usr/local/dcmi \
+  -v /usr/local/Ascend/driver/tools/hccn_tool:/usr/local/Ascend/driver/tools/hccn_tool \
+  -v /usr/local/bin/npu-smi:/usr/local/bin/npu-smi \
+  -v /usr/local/Ascend/driver/lib64/:/usr/local/Ascend/driver/lib64/ \
+  -v /usr/local/Ascend/driver/version.info:/usr/local/Ascend/driver/version.info \
+  -v /etc/ascend_install.info:/etc/ascend_install.info \
+  -v /root/.cache:/root/.cache \
+	   -v  /root/code:/root/code  \
+  -it $IMAGE bash
+
+docker exec -it vllm-a3 bash 
+
+
+
+
+#!/bin/sh
+# Load model from ModelScope to speed up download
+export VLLM_USE_MODELSCOPE=true
+# To reduce memory fragmentation and avoid out of memory
+export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
+export HCCL_BUFFSIZE=512
+export OMP_PROC_BIND=false
+export OMP_NUM_THREADS=1
+export TASK_QUEUE_ENABLE=1
+
+vllm serve /root/code/Qwen3.5-27B \
+--host 0.0.0.0 \
+--port 8000 \
+--data-parallel-size 1 \
+--tensor-parallel-size 2 \
+--seed 1024 \
+--served-model-name qwen3.5 \
+--max-num-seqs 32 \
+--max-model-len 133000 \
+--max-num-batched-tokens 8096 \
+--trust-remote-code \
+--gpu-memory-utilization 0.90 \
+--no-enable-prefix-caching \
+--speculative_config '{"method": "qwen3_5_mtp", "num_speculative_tokens": 3, "enforce_eager": true}' \
+--compilation-config '{"cudagraph_mode":"FULL_DECODE_ONLY"}' \
+--additional-config '{"enable_cpu_binding":true}' \
+--async-scheduling
+
+
+====================
+DBO 适配记录（2026-04-02）
+====================
+
+一、目标
+1. 让 vllm-ascend 在 Ascend 环境下可以接受并运行 --enable-dbo。
+2. 补齐 Ascend 路径的 microbatch 相关逻辑，保证代码路径可执行。
+3. 对比原版与修改版的行为差异，并记录性能现象。
+
+二、代码修改路径
+1. platform.py
+   - 当 enable_dbo=True 时，覆盖 all2all_backend 为 deepep_low_latency。
+   - 目的：绕过 vLLM 配置校验中对 DBO backend 的断言。
+
+2. worker.py
+   - 将 workspace manager 的 num_ubatches 从固定 1 改为：
+     num_ubatches = 2 if enable_dbo else 1
+   - 目的：在 DBO 打开时为 ubatch 预留运行时结构。
+
+3. model_runner_v1.py
+   - 只在 DP>1 时调用 check_ubatch_thresholds。
+   - 为 Ascend attention metadata 增加 _ascend_split_attn_metadata。
+   - attn metadata builder 循环改为支持 ubatch_slices。
+   - dummy_run 改为使用 should_ubatch + maybe_create_ubatch_slices。
+   - create_attn_groups 改为按 num_ubatches 创建 metadata builders。
+   - 目的：补齐 Ascend 的 DBO / ubatch 执行路径。
+
+三、功能验证结果
+1. 原版容器 vllm-a3-orig（不覆盖代码）
+   - 加入 --enable-dbo 后启动失败。
+   - 关键报错：
+     Microbatching currently only supports the deepep_low_latency and
+     deepep_high_throughput all2all backend.
+     flashinfer_all2allv is not supported.
+   - 结论：原版 vllm-ascend 不支持直接打开 DBO。
+
+2. 修改版容器 vllm-a3（覆盖 platform.py / worker.py / model_runner_v1.py）
+   - 可正常启动。
+   - 日志可见：
+     DBO enabled on Ascend: overriding all2all_backend to 'deepep_low_latency'
+   - 可正常返回推理结果。
+   - 结论：修改后 Ascend 已可接受并运行 DBO 参数。
+
+四、当前重要结论
+1. 当前主启动参数是 DP=1, TP=2。
+2. 代码已对齐 GPU 逻辑：仅当 DP>1 时 should_ubatch 才可能为 True。
+3. 因此在当前 DP=1 下，即使打开 DBO，真正的 ubatch overlap 也不会充分发生。
+4. 当前修改解决的是“Ascend 上 DBO 无法启动”的功能问题，不代表当前配置下会有稳定性能收益。
+
+五、小样本压测结果（20 请求，并发 4，prompt=Hello，max_tokens=32）
+1. 修改版 + DBO on + threshold=32
+   - wall_time_sec=15.2958
+   - req_per_sec=1.3075
+   - completion_toks_per_sec=41.8415
+   - lat_avg_sec=2.9296
+   - lat_p50_sec=1.6203
+   - lat_p95_sec=8.0820
+   - lat_p99_sec=9.0124
+
+2. 修改版 + DBO off
+   - wall_time_sec=8.4481
+   - req_per_sec=2.3674
+   - completion_toks_per_sec=75.7563
+   - lat_avg_sec=1.5614
+   - lat_p50_sec=1.5746
+   - lat_p95_sec=2.1581
+   - lat_p99_sec=2.2568
+
+3. 修改版 + DBO on + threshold=1
+   - wall_time_sec=8.4623
+   - req_per_sec=2.3634
+   - completion_toks_per_sec=75.6295
+   - lat_avg_sec=1.5638
+   - lat_p50_sec=1.5629
+   - lat_p95_sec=2.1472
+   - lat_p99_sec=2.2508
+
+4. 修改版 + DBO on + threshold=128
+   - wall_time_sec=7.6942
+   - req_per_sec=2.5994
+   - completion_toks_per_sec=83.1800
+   - lat_avg_sec=1.4999
+   - lat_p50_sec=1.5095
+   - lat_p95_sec=1.9670
+   - lat_p99_sec=1.9951
+
+六、如何解读上述性能
+1. 这些结果不能直接说明 threshold=128 一定最优。
+2. 由于当前是 DP=1，理论上不会触发真正的 DBO overlap，结果更容易受 warmup、图捕获、cache、调度噪声影响。
+3. 当前最可靠的结论是：
+   - 原版不支持 DBO。
+   - 修改版支持 DBO。
+   - DP=1 配置下，不应期待稳定、显著的 DBO 性能收益。
+
+七、后续优化方案
+方案 A：继续用当前 DP=1, TP=2
+   - 只能做参数层面的微调。
+   - 可继续测试 dbo_decode_token_threshold=1/32/64/128/256。
+   - 但收益预期有限，更多是验证无回退和稳定性。
+
+方案 B：改为 DP=2, TP=2（推荐）
+   - 使用 4 张卡。
+   - 这是更符合 DBO 设计目标的场景。
+   - 此时 compute 与 DP communication 才有可能真正 overlap。
+   - 更适合验证 should_ubatch、num_ubatches、ubatch_slices 是否真的参与执行。
+
+八、推荐下一步实验（DP=2, TP=2）
+推荐在修改版容器 vllm-a3 中运行：
+
+#!/bin/sh
+export VLLM_USE_MODELSCOPE=true
+export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
+export HCCL_BUFFSIZE=512
+export OMP_PROC_BIND=false
+export OMP_NUM_THREADS=1
+export TASK_QUEUE_ENABLE=1
+
+vllm serve /root/code/Qwen3.5-27B \
+--host 0.0.0.0 \
+--port 8002 \
+--data-parallel-size 2 \
+--tensor-parallel-size 2 \
+--seed 1024 \
+--served-model-name qwen3.5 \
+--max-num-seqs 32 \
+--max-model-len 133000 \
+--max-num-batched-tokens 8096 \
+--trust-remote-code \
+--gpu-memory-utilization 0.90 \
+--no-enable-prefix-caching \
+--speculative_config '{"method": "qwen3_5_mtp", "num_speculative_tokens": 3, "enforce_eager": true}' \
+--compilation-config '{"cudagraph_mode":"FULL_DECODE_ONLY"}' \
+--additional-config '{"enable_cpu_binding":true}' \
+--async-scheduling \
+--enable-dbo \
+--dbo-decode-token-threshold 32
+
+九、DP=2, TP=2 下建议观察的点
+1. 日志中 should_ubatch 是否为 True。
+2. num_ubatches 是否为 2。
+3. 是否出现 ubatch_slices 相关路径。
+4. 与 DBO off 相比，req_per_sec / completion_toks_per_sec 是否提升。
+5. P95 / P99 延迟是否改善或变差。
+
+十、当前阶段总结
+1. Ascend DBO 适配已经打通启动链路。
+2. 原版不支持 DBO，修改版支持 DBO。
+3. 当前 DP=1 的性能结论不具代表性。
+4. 真正需要继续验证的是 DP=2, TP=2 场景。
+
+十一、DP=2, TP=2 实测记录（2026-04-02）
+1. 实验配置
+   - 容器：vllm-a3（已同步修改版 platform.py / worker.py / model_runner_v1.py）
+   - 卡：容器内 4 张卡（0,1,2,3）
+   - 端口：8002
+   - data_parallel_size=2
+   - tensor_parallel_size=2
+   - max_tokens=32
+   - 压测：20 请求，并发 4
+
+2. 启动结果
+   - DP=2, TP=2 + DBO on 可正常启动。
+   - 日志显示 4 个 worker 正常拉起，两个 API server 正常 ready。
+   - 单请求验证通过。
+
+3. 小样本压测结果
+   3.1 DBO on + threshold=32
+   - wall_time_sec=6.7454
+   - req_per_sec=2.9650
+   - completion_toks_per_sec=94.8799
+   - lat_avg_sec=1.2327
+   - lat_p50_sec=1.2059
+   - lat_p95_sec=1.5940
+   - lat_p99_sec=1.6272
+
+   3.2 DBO off
+   - wall_time_sec=6.3923
+   - req_per_sec=3.1288
+   - completion_toks_per_sec=100.1208
+   - lat_avg_sec=1.1877
+   - lat_p50_sec=1.1890
+   - lat_p95_sec=1.5381
+   - lat_p99_sec=1.5917
+
+   3.3 DBO on + threshold=1
+   - wall_time_sec=6.2423
+   - req_per_sec=3.2040
+   - completion_toks_per_sec=102.5266
+   - lat_avg_sec=1.1896
+   - lat_p50_sec=1.1968
+   - lat_p95_sec=1.5672
+   - lat_p99_sec=1.6621
+
+   3.4 DBO on + threshold=128
+   - wall_time_sec=6.3321
+   - req_per_sec=3.1585
+   - completion_toks_per_sec=101.0728
+   - lat_avg_sec=1.1963
+   - lat_p50_sec=1.1825
+   - lat_p95_sec=1.4832
+   - lat_p99_sec=1.5135
+
+4. DP=2, TP=2 结果解读
+   - threshold=32 明显不是当前最优点，性能低于 DBO off。
+   - threshold=1 与 threshold=128 都接近或略优于 DBO off。
+   - 在当前这轮小样本中：
+     * best req/s = threshold=1（3.2040）
+     * best completion_toks/s = threshold=1（102.5266）
+     * best p95/p99 = threshold=128（1.4832 / 1.5135）
+   - 说明在 DP=2, TP=2 下，DBO 已经具备继续调参的价值，但需要更大样本验证。
+
+5. 当前推荐
+   - 如果目标是继续做性能优化，优先继续测试：threshold=1 / 64 / 128。
+   - 如果目标是先保持稳妥，暂时不要使用 threshold=32。
+   - 建议下一轮压测扩大到：
+     * total=100 或 200
+     * concurrency=8 或 16
+     * 更长输出（如 max_tokens=128 或 256）
+   - 建议同时记录 warmup 后的第二轮和第三轮结果，减少图捕获和 cache 抖动影响。
+
+6. 当前阶段结论更新
+   - 原版：不支持 DBO，启动阶段直接失败。
+   - 修改版：支持 DBO，且在 DP=2, TP=2 下可稳定启动和推理。
+   - 在当前小样本中，DBO 不是天然变快，阈值选择很关键。
+   - 当前最值得继续优化的方向是 DP=2, TP=2 + threshold 搜索，而不是 DP=1。
+
+# 只能在服务器调用  ，已验证成功 
+curl --location --request POST 'http://127.0.0.1:8000/v1/chat/completions' \
+--header 'Accept: application/json' \
+--header 'Content-Type: application/json' \
+--header 'Connection: keep-alive' \
+--data-raw '{
+    "model": "qwen3.5",
+    "max_tokens": 5000,
+    "messages": [
+        {
+            "role": "system",
+            "content": "You are a helpful customer support assistant. Use the supplied tools to assist the user."
+        },
+        {
+            "role": "user",
+            "content": "你是谁"
+        }
+    ],
+    "stream": false
+}'
+
+
+
+启动镜像：
+  export IMAGE=m.daocloud.io/quay.io/ascend/vllm-ascend:nightly-releases-v0.18.0-a3
+  export NAME=vllm-a3-orig
+
+  # Run the container using the defined variables
+  # Note: If you are running bridge network with docker, please expose available ports for multiple nodes communication in advance.
+docker run -d --privileged \
+  --name $NAME \
+  --net=host \
+  --privileged=true \
+  --shm-size=1g \
+  --device /dev/davinci4 \
+  --device /dev/davinci5 \
+  --device /dev/davinci6 \
+  --device /dev/davinci7 \
+  --device /dev/davinci_manager \
+  --device /dev/devmm_svm \
+  --device /dev/hisi_hdc \
+  -v /usr/local/dcmi:/usr/local/dcmi \
+  -v /usr/local/Ascend/driver/tools/hccn_tool:/usr/local/Ascend/driver/tools/hccn_tool \
+  -v /usr/local/bin/npu-smi:/usr/local/bin/npu-smi \
+  -v /usr/local/Ascend/driver/lib64/:/usr/local/Ascend/driver/lib64/ \
+  -v /usr/local/Ascend/driver/version.info:/usr/local/Ascend/driver/version.info \
+  -v /etc/ascend_install.info:/etc/ascend_install.info \
+  -v /root/.cache:/root/.cache \
+	   -v  /root/code:/root/code  \
+  -it $IMAGE bash
+
+docker exec -it vllm-a3-orig bash 
+
+#!/bin/sh
+# Load model from ModelScope to speed up download
+export VLLM_USE_MODELSCOPE=true
+# To reduce memory fragmentation and avoid out of memory
+export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
+export HCCL_BUFFSIZE=512
+export OMP_PROC_BIND=false
+export OMP_NUM_THREADS=1
+export TASK_QUEUE_ENABLE=1
+
+vllm serve /root/code/Qwen3.5-27B \
+--host 0.0.0.0 \
+--port 9000 \
+--data-parallel-size 1 \
+--tensor-parallel-size 2 \
+--seed 1024 \
+--served-model-name qwen3.5 \
+--max-num-seqs 32 \
+--max-model-len 133000 \
+--max-num-batched-tokens 8096 \
+--trust-remote-code \
+--gpu-memory-utilization 0.90 \
+--no-enable-prefix-caching \
+--speculative_config '{"method": "qwen3_5_mtp", "num_speculative_tokens": 3, "enforce_eager": true}' \
+--compilation-config '{"cudagraph_mode":"FULL_DECODE_ONLY"}' \
+--additional-config '{"enable_cpu_binding":true}' \
+--async-scheduling

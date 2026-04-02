@@ -1,0 +1,22 @@
+﻿# Qwen3.5 baseline versions
+# Generated: 2026-03-04
+
+[vllm]
+path=e:\codevllm\vllm
+head=65bb4942b11873bcfa5a7800e0cc69124c342835
+log=65bb4942b fix qwen3_vl_moe tie_word_embeddings
+base_checkout=a75a5b54c7f76bc2e15d3025d6
+merged_ref=origin/pull/34521/head (local ref: pr-34521)
+
+[vllm-ascend]
+path=e:\codevllm\vllm-ascend
+head=52aa9c006e84f032e91f7b76d668da39ce542788
+log=52aa9c00 Temporary fix available_kv_cache_memory in the linear attention scenario
+base_checkout=c63b7a11888e9e1caeeff8
+merged_ref=origin/pull/6742/head (local ref: pr-6742)
+
+[transformers]
+path=e:\codevllm\transformers
+head=fc9137225880a9d03f130634c20f9dbe36a7b8bf
+log=fc91372258 Adding Support for Qwen3.5 (#43830)
+base_checkout=fc9137225880a9d03f130634c20f9dbe36a7b8bf

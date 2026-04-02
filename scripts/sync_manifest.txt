@@ -1,0 +1,6 @@
+vllm-ascend/vllm_ascend/utils.py
+vllm-ascend/vllm_ascend/patch/platform/patch_mamba_config.py
+vllm-ascend/vllm_ascend/quantization/modelslim_config.py
+vllm-ascend/vllm_ascend/worker/model_runner_v1.py
+vllm/vllm/model_executor/models/qwen3_5_mtp.py
+vllm/vllm/model_executor/models/qwen3_next_mtp.py

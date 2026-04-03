@@ -292,6 +292,166 @@ vllm serve /root/code/Qwen3.5-27B \
    - 在当前小样本中，DBO 不是天然变快，阈值选择很关键。
    - 当前最值得继续优化的方向是 DP=2, TP=2 + threshold 搜索，而不是 DP=1。
 
+十二、DBO 本质是 MoE 特性：调整说明（2026-04-02）
+
+1. 重要发现
+   DBO 在上游设计语义上明确是为 MoE DP+EP 部署设计的。
+   核心目的：将 MoE 层内稀疏 all-to-all 通信与周边 compute 重叠。
+   要求：--data-parallel-size N>1 + --enable-expert-parallel
+   通信重叠实现点：FusedMoEModularKernel.forward 中的 dbo_yield 调用。
+   来源：vllm/docs/design/dbo.md line 5, 32。
+
+2. 之前测试模型 Qwen3.5-27B 是 dense 模型
+   架构：Qwen3ForCausalLM（无 MoE 层）
+   在 dense 模型上启用 DBO 只是开了 ubatch splitting 路径，没有
+   FusedMoE 层，不存在任何 dispatch/combine 通信可以与 compute 重叠。
+   之前 DP=1/DP=2 的测试只能证明"Ascend 上 DBO 参数不会让服务崩溃"，
+   不能证明 DBO 的真正价值。
+
+3. 服务器已有 Qwen3.5-35B-A3B（MoE 模型）
+   路径：/root/code/Qwen3.5-35B-A3B
+   架构：Qwen3_5MoeForConditionalGeneration（真正的 MoE 模型）
+   vllm 已注册：registry.py 里 Qwen3_5MoeForConditionalGeneration 已注册
+   Ascend 已验证：test_qwen3_moe.py 用 TP=2 + EP=True 跑通过 Qwen3-30B-A3B
+   MTP 投机解码：Qwen3_5MoeMTP 也已注册，未来可用
+
+4. 当前 DBO 实现的准确定位（三层）
+   功能层：dense 模型 + DBO → 不再崩溃（已验证）
+   机制层：MoE + DP>1 + EP → ubatch splitting 路径走通（当前进行中）
+   价值层：MoE + DP>1 + EP + dbo_yield hooks → 真正通信重叠（尚未实现）
+
+5. Ascend FusedMoE 当前缺少 dbo_yield hooks
+   vllm-ascend 下没有任何 dbo_yield 相关代码。
+   即使用 MoE + EP 跑 DBO，当前 Ascend 路径只做了 ubatch splitting，
+   FusedMoE forward 里没有 yield 点，没有通信/计算交错。
+   后续需要：在 Ascend 的 FusedMoE 算子里参考 GPU 路径添加 dbo_yield 支持。
+
+6. platform.py 代码调整（本次修改）
+   在 DBO all2all_backend 覆盖块后新增两个 warning：
+   a. dense 模型 + DBO → WARNING：只有 ubatch splitting，无通信重叠收益
+   b. MoE + DBO 但无 --enable-expert-parallel → WARNING：无 all-to-all 可重叠
+   这样日志里就能清楚区分当前 DBO 处于哪一层。
+
+7. MoE 模型启动命令（正确 DBO 验证场景）
+   脚本：start_moe_dbo.sh / start_moe_nodbo.sh（port 8003）
+   关键参数（对比 dense 脚本新增）：
+   - model: /root/code/Qwen3.5-35B-A3B
+   - --enable-expert-parallel
+   - --max-model-len 32768
+   - HCCL_BUFFSIZE=1024
+
+8. 分层验证建议
+   第一步：功能验证（已完成）→ dense 模型 + DBO 不再崩溃，有 warning 日志
+   第二步：MoE 机制验证（进行中）→ Qwen3.5-35B-A3B + DP=2 + EP + DBO 是否可启动
+   第三步：MoE 性能对比（下一步）→ DBO on vs DBO off，看 ubatch 对 MoE 有无收益
+   第四步：真正价值验证（future work）→ 添加 dbo_yield hooks 后再测
+
+9. 当前实验状态
+   vllm-a3 容器：正在拉起 Qwen3.5-35B-A3B + DP=2 + DBO（无 EP）（port 8003）
+   vllm-a3-orig 容器：不变，用作原版对照
+
+十三、DBO Ascend 实现深层分析与修复（2026-04-02 续）
+
+1. MoE 模型启动失败根因分析
+   第一次失败：DeepEPLLPrepareAndFinalize NameError
+     - all2all_backend='deepep_low_latency' 绕过了配置校验
+     - 但 all2all_utils.py 的 DeepEP 导入受 `if current_platform.is_cuda_alike():` 保护
+     - Ascend 不是 CUDA-like → DeepEP 类从未被导入
+     - EP+MoE 运行期尝试实例化 DeepEPLLPrepareAndFinalize → NameError
+     - 修复：去掉 --enable-expert-parallel（EP 需要 DeepEP，Ascend 还没有）
+
+   第二次失败：assert isinstance(attn_metadata, dict) AssertionError
+     - patch_qwen3_5.py 的 AscendQwen3_5GatedDeltaNet._forward_core:127
+     - 当 should_ubatch=True 时，model_runner 生成 attn_metadata = list[dict]
+     - 但 GDN 的 _forward_core 严格断言 isinstance(attn_metadata, dict)
+
+2. Ascend DBO 实现的根本缺口（双执行循环缺失）
+   GPU 路径（完整实现）：
+     UBatchWrapper.forward() 运行模型两次：
+       ubatch 0: set_forward_context(attn_metadata[0]) → model.forward()
+       ubatch 1: set_forward_context(attn_metadata[1]) → model.forward()
+     每次模型看到的是单个 dict，所有注意力层正常工作
+
+   Ascend 当前路径（不完整）：
+     set_ascend_forward_context(attn_metadata=[dict0, dict1]) → model.forward()
+     模型只跑一次，forward_context.attn_metadata = list[dict]
+     所有注意力层都期望 dict → 不工作
+     GDN 有严格 assert → 立刻崩溃
+     标准 attention 有 `if isinstance(attn_metadata, dict):` 软检查 → 
+       实际上 list 不会进 dict 分支，attn_metadata 保持为 list → 后续计算会出错
+
+3. 为什么密集模型测试"看起来正常"
+   密集模型（Qwen3.5-27B）测试时：
+     - 所有测试批次都 < 32 token（并发=4，每请求 1-4 个 decode token）
+     - threshold=32：should_ubatch 从未为 True
+     - threshold=1：理论上会触发，但 DP=2 场景下没有验证是否真的有 decode 请求
+   结论：之前的 DBO 测试实际上没有触发 ubatch 路径，是在测 DBO=off 的基线
+
+4. 本次修复
+   文件：model_runner_v1.py
+   位置：_determine_batch_execution_and_padding，should_ubatch 判断处
+   修改：将 `if allow_microbatching:` 改为 `if allow_microbatching and not self._has_gdn:`
+   效果：带 GDN 层的模型（Qwen3_5ForConditionalGeneration, Qwen3_5MoeForConditionalGeneration）
+         将永远不进入 ubatch 路径，避免崩溃
+
+5. 未来需要实现的内容（才是真正的 DBO）
+   在 model_runner_v1.py 中实现双执行循环：
+   ```python
+   if should_ubatch:
+       for ubid, ubatch_meta in enumerate(attn_metadata):
+           with set_ascend_forward_context(ubatch_meta, ...):
+               hidden_states_ubatch = _model_forward(ubatch_tokens[ubid], ...)
+       # merge hidden_states
+   else:
+       with set_ascend_forward_context(attn_metadata, ...):
+           hidden_states = _model_forward(...)
+   ```
+   同时还需要：
+   - 按 ubatch 拆分 input_ids/positions/inputs_embeds
+   - 在适当的位置插入 dbo_yield（让 MoE 通信与另一个 ubatch 的计算重叠）
+   - 合并两个 ubatch 的 hidden_states 和 logits
+
+6. 当前 DBO 实现的最终定位
+   config 层：DBO 参数不再导致启动失败 ✓ (platform.py all2all_backend bypass)
+   metadata 层：ubatch_slices 和 split_attn_metadata 逻辑已实现 ✓
+   执行层：双执行循环 ✗ (未实现，TODO)
+   通信层：dbo_yield hooks in FusedMoE ✗ (未实现，TODO)
+   
+   换言之：当前代码实现了 DBO 需要的"元数据准备"，
+   但没有实现"双执行"和"通信重叠"，DBO 实际上是 no-op（什么都不做）
+
+十四、MoE 模型 DBO on vs off 性能对比（2026-04-02）
+
+环境：Qwen3.5-35B-A3B (MoE), DP=2, TP=2, port=8003
+基准：bench_vllm.py, 20 req, concurrency=4, max_tokens=64, prompt="Hello"
+（无 EP，DBO ubatch 路径因 _has_gdn 守卫未触发）
+
+结果：
+  DBO on  (threshold=32): 258.6 tok/s, avg=0.987s, p95=1.062s
+  DBO off (baseline)    : 262.1 tok/s, avg=0.974s, p95=1.112s
+
+分析：
+  两者性能无显著差异（在噪声范围内）。
+  原因：DBO ubatch 路径被 _has_gdn 守卫完全禁用，DBO = no-op。
+  这是预期结果。真正的 DBO 收益需要完整的双执行循环 + MoE EP + dbo_yield hooks。
+
+结论（完整 DBO 实现路线图）：
+  阶段 1（当前完成）：
+    - platform.py：DBO 参数不再导致 Ascend 启动失败（config bypass）
+    - platform.py：WARNING 区分 dense/MoE/有无EP，帮助用户理解当前限制
+    - model_runner_v1.py：GDN 模型禁止 ubatching（_has_gdn 守卫）
+    - model_runner_v1.py：should_ubatch 在 DP>1 时才评估（正确语义）
+    - 验证：dense + DBO / MoE + DBO（无 EP）均可正常启动和推理
+  阶段 2（下一步）：
+    - 实现双执行循环（两次 _model_forward，各自 set_forward_context）
+    - 拆分 input_ids/positions 给每个 ubatch
+    - 合并两个 ubatch 的 hidden_states
+    - 去掉 _has_gdn 守卫（GDN 层按全批处理，其他层按 ubatch 处理）
+  阶段 3（长期）：
+    - 在 Ascend FusedMoE 算子中加 dbo_yield hooks
+    - 实现真正的 MoE 通信/计算重叠
+    - 需要 EP 支持（不依赖 DeepEP，使用 Ascend 原生 HCCL EP 通信）
+
 # 只能在服务器调用  ，已验证成功 
 curl --location --request POST 'http://127.0.0.1:8000/v1/chat/completions' \
 --header 'Accept: application/json' \
@@ -344,6 +504,208 @@ docker run -d --privileged \
   -it $IMAGE bash
 
 docker exec -it vllm-a3-orig bash 
+
+补充说明（2026-04-03）：
+
+1. 对 Qwen3.5-35B-A3B 这类含 GDN / linear_attention 的 MoE 模型，
+   后续即使补 dbo_yield hooks / NPU stream overlap，也仍然不会进入
+   当前代码里的 ubatch 双执行路径；要真正受益，前提仍然是：
+   - 找到无 GDN 的纯 Transformer MoE 模型
+   - 或实现 GDN-compatible per-layer ubatching
+
+2. 已将 `Qwen/Qwen3-30B-A3B` 以 `GIT_LFS_SKIP_SMUDGE=1` 拉到本地：
+   `E:\codevllm\qwen3-30b`
+
+3. 本地检查结果：
+   - `config.json` 中 `architectures = ["Qwen3MoeForCausalLM"]`
+   - `model_type = "qwen3_moe"`
+   - `num_experts = 128`
+   - 配置文本里未显式出现 `layer_types` / `linear_attention`
+
+4. 因此从静态配置看，`Qwen3-30B-A3B` 比 `Qwen3.5-35B-A3B` 更像纯
+   Transformer MoE，可以作为“无 GDN 候选验证模型”继续尝试。
+
+5. 但这还不是最终结论。当前 `vllm_ascend.utils.check_gdn_layer()` 只检查
+   HF config / text_config 中是否显式存在 `linear_attention`；因此还需要
+   再走一次 vLLM 实际加载，确认运行时解析后的 config 不会内部补出
+   `layer_types`，再把它视为最终的“无 GDN 验证模型”。
+
+===========================================================================
+## 阶段2：DBO 顺序双执行循环实现（Sequential Dual-Execution Loop）
+## 日期：2026-04-02
+===========================================================================
+
+### 背景
+
+阶段1 确认 Ascend DBO 存在根本性架构缺陷：
+- GPU 的 UBatchWrapper 用多线程并发运行两个 ubatch，每个线程持有独立
+  forward_context（attn_metadata[ubid]），实现 MoE all-to-all 与计算的重叠。
+- Ascend 的 execute_model 只有单次 _model_forward，attn_metadata 为
+  list[dict] 时全部传入，attention backend 期望 dict → AssertionError。
+- 结论：Ascend DBO 是 no-op，需要实现双执行循环。
+
+### 实现方案
+
+文件：vllm_ascend/worker/model_runner_v1.py
+
+#### execute_model 改动（行 ~1424–1515）
+
+原来：
+    with set_ascend_forward_context(attn_metadata, ...), ...:
+        hidden_states = self._model_forward(num_tokens_padded, ...)
+
+现在：
+    with record_function("forward"), maybe_get_kv_connector_output(...):
+        if ubatch_slices is not None:
+            # 顺序双执行：每个 ubatch 独立 set_ascend_forward_context
+            ubatch_hs_list = []
+            for ubid, ubatch_slice in enumerate(ubatch_slices_attn):
+                tok_sl = ubatch_slice.token_slice
+                ub_* = slice inputs, positions, embeds, intermediates per tok_sl
+                ub_num_tokens_across_dp = [ub_num_tokens] * dp_size
+                with set_ascend_forward_context(attn_metadata[ubid], ...):
+                    ub_hs = self._model_forward(ub_num_tokens, ub_*, ...)
+                ubatch_hs_list.append(ub_hs)
+            hidden_states = torch.cat(ubatch_hs_list, dim=0)
+        else:
+            with set_ascend_forward_context(attn_metadata, ...):
+                hidden_states = self._model_forward(num_tokens_padded, ...)
+
+#### _dummy_run 改动（行 ~2632–2704）
+
+同样模式，条件为 `ubatch_slices is not None and attn_metadata is not None`，
+使用 `_ubatch_slices_attn = ubatch_slices_padded if FULL else ubatch_slices`。
+
+#### _has_gdn 注释更新
+
+移除了 "TODO: implement dual-execution loop" — 循环已实现。
+保留 _has_gdn 守卫（GDN 是递归状态机，跨两次 forward 会丢失状态，
+根本不能拆分 token batch）。
+
+### 设计对比
+
+| 维度                | GPU UBatchWrapper          | Ascend 顺序双执行            |
+|---------------------|---------------------------|------------------------------|
+| 并发方式            | threading.Thread×2        | 顺序 for 循环                |
+| comm/compute overlap | ✓（DeepEP + SM 分配）     | ✗（两次串行，TODO）           |
+| forward_context     | 每线程独立 (attn_dict)    | 每 ubatch 独立 (attn_dict)   |
+| 结果合并            | torch.cat on id-sorted    | torch.cat 顺序               |
+| GDN 支持            | N/A（GPU 无 GDN 模型）    | _has_gdn 守卫禁用             |
+| KV Connector        | 每 ubatch 独立            | 外层 maybe_get_kv_connector  |
+
+### 验证结果
+
+测试环境：dense Qwen3.5-27B，DP=2，TP=1，--dbo-decode-token-threshold 1
+（threshold=1 强制 uniform_decode 时每个 decode step 触发 should_ubatch=True）
+
+DBO 开（顺序双执行）：
+  total=20, concurrency=4, max_tokens=32
+  66.7 tok/s, lat_avg=1.904s, lat_p95=1.970s, errors=0
+
+DBO 关（基线）：
+  total=20, concurrency=4, max_tokens=32
+  63.7 tok/s, lat_avg=1.887s, lat_p95=2.106s, errors=0
+
+结论：
+- 顺序双执行无性能差异（在噪声范围内），符合预期（没有实际 overlap）。
+- 服务正常启动和推理，无 AssertionError，双执行路径验证通过。
+
+### 已知限制和后续工作
+
+1. 空 ubatch 问题（known pre-existing）：
+   Ascend 的 _sync_batch_across_dp 不包含 GPU 中的 is_last_ubatch_empty 检查。
+   当 num_tokens=1 且 split_point=0 时，ubatch0 为空 slice，会触发
+   `assert not ubatch_slice.is_empty()`。实际请求量 >= concurrency/dp_size 时
+   不触发（每 rank >= 2 tokens）。修复需在 _determine_batch_execution_and_padding
+   里加 is_last_ubatch_empty 检查或在 maybe_create_ubatch_slices 调用处加保护。
+
+2. 真正的通信/计算重叠（comm/compute overlap）：
+   需要在 Ascend FusedMoE 实现中加入 dbo_yield hooks（GPU 用 DeepEP 的
+   high-throughput 模式实现），并切换为 threading 或 NPU stream 并发。
+   这是阶段3的工作。
+
+3. EP（Expert Parallelism）依赖：
+   GPU DBO 主要对 MoE+EP 有意义；Ascend 目前缺少 Ascend-native EP+all2all。
+   DeepEP 不支持 NPU。需要在 all2all_utils.py 加 Ascend 分支。
+
+===========================================================================
+## MoE 双容器 bench 对比 & GDN 限制分析
+## 日期：2026-04-02
+===========================================================================
+
+### 测试方案
+
+- vllm-a3 (davinci0-3, NPU 0-3): Qwen3.5-35B-A3B + DP=2 TP=2
+  * 方案A: DBO on  (start_moe_dbo.sh,     port 8003)
+  * 方案B: DBO off (start_moe_nodbo_local, port 8003)
+- vllm-a3-orig (davinci4-7, NPU 4-7): DBO off 对比 (port 8004)
+  * 需要设置 ASCEND_RT_VISIBLE_DEVICES=4,5,6,7（见下）
+
+### 设备隔离问题及解决方案
+
+vllm-a3 和 vllm-a3-orig 共享 /dev/davinci_manager，导致 torch_npu 在两个
+容器内均能枚举 16 个物理 chip (0-15)。不设置环境变量时两者都默认使用
+chip 0-3，造成内存冲突。
+
+解决：在 vllm-a3-orig 中设置
+  export ASCEND_RT_VISIBLE_DEVICES=4,5,6,7
+这样 torch_npu 内部 device 0-3 对应物理 chip 4-7，避免与 vllm-a3 冲突。
+
+### GDN 层验证
+
+Qwen3.5-35B-A3B config.json 的 text_config.layer_types 包含大量
+"linear_attention" 条目（约 30 个），check_gdn_layer() 返回 True。
+
+结论：_has_gdn=True → should_ubatch=False → DBO 对该模型完全 no-op。
+
+### 同硬件 DBO on vs off bench（vllm-a3，NPU 0-3）
+
+参数：total=60, concurrency=8, max_tokens=64, 预热 20req 后取 3 轮均值
+
+DBO on (modified code)：
+  轮1: 447.9 tok/s, lat_avg=1.077s
+  轮2: 448.1 tok/s, lat_avg=1.077s
+  轮3: 447.6 tok/s, lat_avg=1.078s
+  均值: 448 tok/s  ± 0.3 (极低方差)
+
+DBO off (same hardware baseline)：
+  轮1: 449.6 tok/s, lat_avg=1.072s
+  轮2: 415.5 tok/s, lat_avg=1.148s  ← 正常调度抖动
+  轮3: 469.6 tok/s, lat_avg=1.025s
+  均值: ~445 tok/s  ± 27 (正常方差)
+
+结论：DBO on 与 off 性能无显著差异（448 vs 445，差异 < 1%），完全符合
+预期（_has_gdn=True → no-op）。
+
+### is_last_ubatch_empty 补丁
+
+GPU 的 coordinate_batch_across_dp 内部有 is_last_ubatch_empty 检查，
+防止 padded batch 过小时产生空 ubatch（如 1-token 分 2 ubatch → ubatch0
+size=0 → assert not ubatch_slice.is_empty() 崩溃）。
+
+Ascend 的 _sync_batch_across_dp 缺少此检查。已修复：
+  vllm_ascend/worker/model_runner_v1.py
+  - 新增 import: is_last_ubatch_empty
+  - _determine_batch_execution_and_padding 中 check_ubatch_thresholds
+    后增加保护：
+    if should_ubatch and is_last_ubatch_empty(num_tokens, num_tokens_padded,
+                                              num_ubatches):
+        should_ubatch = False
+
+### 当前 DBO on Ascend 适用范围总结
+
+| 模型类型                              | should_ubatch | DBO效果     |
+|---------------------------------------|---------------|-------------|
+| Dense (Qwen3.5-27B), DP=2, 无GDN     | True          | 双执行路径✓  |
+| MoE (Qwen3.5-35B-A3B), DP=2, 有GDN   | False (守卫)  | no-op       |
+| MoE 无GDN (假设), DP=2, 无EP          | True          | 双执行路径✓  |
+| MoE 无GDN (假设), DP=2, 有EP+DeepEP  | True          | 真正overlap✓|
+
+目前 Ascend 可用的 MoE 模型（Qwen3.5-35B-A3B）有 GDN 层，需等待：
+1. 有纯 Transformer MoE 模型（无 linear_attention）
+2. 或实现 GDN-compatible per-layer ubatching（复杂度高）
+
+===========================================================================
 
 #!/bin/sh
 # Load model from ModelScope to speed up download

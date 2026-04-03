@@ -1,0 +1,27 @@
+#!/bin/bash
+set -euo pipefail
+
+MODEL_PATH="${MODEL_PATH:-Qwen/Qwen3.5-35B-A3B}"
+PORT="${PORT:-8004}"
+SERVED_NAME="${SERVED_NAME:-qwen3.5-35b-a3b}"
+GPU_MEM_UTIL="${GPU_MEM_UTIL:-0.95}"
+MAX_MODEL_LEN="${MAX_MODEL_LEN:-2048}"
+MAX_BATCHED_TOKENS="${MAX_BATCHED_TOKENS:-2048}"
+
+export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1}"
+export VLLM_WORKER_MULTIPROC_METHOD="${VLLM_WORKER_MULTIPROC_METHOD:-spawn}"
+
+vllm serve "${MODEL_PATH}" \
+  --host 0.0.0.0 \
+  --port "${PORT}" \
+  --data-parallel-size 2 \
+  --tensor-parallel-size 1 \
+  --seed 1024 \
+  --served-model-name "${SERVED_NAME}" \
+  --max-num-seqs 8 \
+  --max-model-len "${MAX_MODEL_LEN}" \
+  --max-num-batched-tokens "${MAX_BATCHED_TOKENS}" \
+  --trust-remote-code \
+  --gpu-memory-utilization "${GPU_MEM_UTIL}" \
+  --no-enable-prefix-caching
+

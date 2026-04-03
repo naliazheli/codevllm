@@ -1,0 +1,161 @@
+GPU DBO validation notes (RTX / Vast.ai)
+========================================
+
+Date: 2026-04-03
+Workspace: /root/code/codevllm/vllm-gpu
+Target platform: CUDA GPU (recommended: 2x RTX A6000 48GB)
+Primary target: verify upstream vLLM behavior for Qwen3.5 + DBO on GPU
+
+Goals
+-----
+
+1. Verify whether upstream `vllm` enters the DBO / ubatching path for Qwen3.5 on GPU.
+2. Verify whether Qwen3.5 + DBO on GPU uses any GDN-compatible per-layer ubatching.
+3. Compare DBO on/off behavior for:
+   - Dense Qwen3.5 model
+   - MoE Qwen3.5-35B-A3B model
+4. Record a clean, reproducible workflow for Vast.ai or similar SSH-accessible GPU hosts.
+
+Recommended machine
+-------------------
+
+Preferred:
+- 2x RTX A6000 48GB
+
+Why:
+- Enough to run meaningful DP=2 DBO experiments.
+- Cheaper than A100/H100.
+- Good fit for path verification and medium-scale bench.
+
+Nice to have:
+- Ubuntu 22.04
+- CUDA 12.4 or compatible NVIDIA driver
+- 16+ vCPU
+- 120GB+ system RAM
+- 200GB+ disk
+
+What this setup is good for
+---------------------------
+
+1. Dense Qwen3.5 path verification with `DP=2 + DBO on/off`.
+2. MoE Qwen3.5-35B-A3B functional validation if memory allows.
+3. Logs, assertions, and code-path validation around ubatching.
+4. Early bench comparisons.
+
+What this setup is not ideal for
+--------------------------------
+
+1. Large-scale MoE EP benchmarking.
+2. Final throughput claims for production.
+3. Long-running, high-concurrency H100-class performance conclusions.
+
+Main question to answer
+-----------------------
+
+The key engineering question is:
+
+"For GPU upstream vLLM, when Qwen3.5 uses GDN / linear_attention, does DBO
+fall back to a GDN-compatible per-layer ubatching scheme, or does it still use
+whole-model ubatching?"
+
+Current working hypothesis from source reading:
+
+1. GPU upstream vLLM does not appear to have an `_has_gdn`-style global guard
+   like the local Ascend patch.
+2. GPU DBO appears to be implemented through `UBatchWrapper`, which splits the
+   whole model forward into ubatches.
+3. No clear per-layer "skip only GDN layers, ubatch the rest" implementation
+   has been found yet.
+4. Therefore, runtime validation on real GPUs is required.
+
+Suggested validation order
+--------------------------
+
+Phase 1: environment bring-up
+
+1. Sync local `vllm-gpu/` directory to the remote machine.
+2. Clone or sync the upstream `vllm/` tree to the same workspace.
+3. Create a Python venv or conda env on the remote host.
+4. Install `vllm` in editable mode.
+5. Run a dense Qwen3.5 model first before touching the 35B-A3B MoE model.
+
+Phase 2: dense Qwen3.5 behavior check
+
+1. Start dense Qwen3.5 with `DP=2`, `DBO off`.
+2. Run smoke test.
+3. Start dense Qwen3.5 with `DP=2`, `DBO on`, threshold `1`.
+4. Compare logs and confirm whether ubatching is triggered.
+
+Phase 3: Qwen3.5-35B-A3B MoE behavior check
+
+1. Start `Qwen/Qwen3.5-35B-A3B` with `DP=2`, `DBO off`.
+2. Run smoke test.
+3. Start the same model with `DP=2`, `DBO on`, threshold `1`.
+4. Compare logs, startup behavior, correctness, and throughput.
+
+Phase 4: interpretation
+
+Key evidence to capture:
+
+1. Whether the server starts successfully with `--enable-dbo`.
+2. Whether logs show ubatching-related behavior or wrapper execution.
+3. Whether the MoE model behaves differently from the dense model.
+4. Whether DBO on/off shows correctness or stability differences.
+5. Whether the observed behavior supports or contradicts the "per-layer
+   GDN-compatible ubatching" hypothesis.
+
+Recommended models
+------------------
+
+Dense path verification:
+- `Qwen/Qwen3.5-8B`
+- fallback: `Qwen/Qwen3.5-4B`
+
+MoE target:
+- `Qwen/Qwen3.5-35B-A3B`
+
+Candidate no-GDN MoE comparison model:
+- `Qwen/Qwen3-30B-A3B`
+
+Notes:
+- `Qwen3.5` family has explicit `linear_attention` in vLLM config code.
+- `Qwen3-30B-A3B` looks like a useful MoE candidate without obvious
+  `linear_attention` in its raw config, but should still be validated at load time.
+
+Ports used by the helper scripts
+--------------------------------
+
+- 8001: dense Qwen3.5 DBO on
+- 8002: dense Qwen3.5 DBO off
+- 8003: Qwen3.5-35B-A3B DBO on
+- 8004: Qwen3.5-35B-A3B DBO off
+
+Remote layout
+-------------
+
+Expected remote workspace root:
+- `/root/code/codevllm`
+
+Expected directories after sync:
+- `/root/code/codevllm/vllm`
+- `/root/code/codevllm/vllm-gpu`
+
+Daily workflow
+--------------
+
+1. Rent the machine on Vast.ai.
+2. SSH into the host and prepare Python/CUDA environment.
+3. From the local Windows workspace, run `sync_to_gpu.ps1`.
+4. On the remote host, `cd /root/code/codevllm/vllm-gpu`.
+5. Run the chosen startup script.
+6. In another shell, run `test_completion.py` or `bench_gpu.sh`.
+7. Save logs and compare DBO on/off behavior.
+
+Key caveats
+-----------
+
+1. Single-GPU validation is not enough for meaningful DBO conclusions.
+2. `DP=2` is the minimum recommended setup for this investigation.
+3. If `Qwen3.5-35B-A3B` is too heavy for the rented host, use dense Qwen3.5
+   first to answer the code-path question, then escalate hardware if needed.
+

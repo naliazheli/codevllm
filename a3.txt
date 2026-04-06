@@ -2,7 +2,9 @@
 业务系统 IP	业务系统 用户名	业务系统 密码
 199.98.2.2	root	 
 
-已有模型 qwen3.5-27b   /root/code/Qwen3.5-27B
+已有模型 
+qwen3.5-27b   /root/code/Qwen3.5-27B   
+Qwen3.5-35B-A3B  /root/code/Qwen3.5-35B-A3B
 已有docker环境  已有docker 镜像 ，带 vllm ，vllm-ascend 代码
 
 启动镜像：
@@ -47,7 +49,7 @@ export OMP_PROC_BIND=false
 export OMP_NUM_THREADS=1
 export TASK_QUEUE_ENABLE=1
 
-vllm serve /root/code/Qwen3.5-27B \
+vllm serve /root/code/Qwen3.5-35B-A3B \
 --host 0.0.0.0 \
 --port 8000 \
 --data-parallel-size 1 \
@@ -183,7 +185,7 @@ export OMP_PROC_BIND=false
 export OMP_NUM_THREADS=1
 export TASK_QUEUE_ENABLE=1
 
-vllm serve /root/code/Qwen3.5-27B \
+vllm serve /root/code/Qwen3.5-35B-A3B \
 --host 0.0.0.0 \
 --port 8002 \
 --data-parallel-size 2 \
@@ -734,3 +736,390 @@ vllm serve /root/code/Qwen3.5-27B \
 --compilation-config '{"cudagraph_mode":"FULL_DECODE_ONLY"}' \
 --additional-config '{"enable_cpu_binding":true}' \
 --async-scheduling
+
+===========================================================================
+十五、学生接手执行清单（2026-04-06）
+===========================================================================
+
+目标定位：
+1. 当前阶段先把 Ascend 上的 DBO 做成“功能清楚、验证完整、基准可复现”的版本。
+2. 当前不把“异步重叠 / 真正 overlap”作为立刻落地目标。
+3. 当前 dbo-dev 的准确定位是：
+   - 参数层：--enable-dbo / --dbo-decode-token-threshold 已可接入
+   - 执行层：DP>1 的部分场景可走顺序 dual-execution / ubatch 路径
+   - 性能层：真正通信计算重叠尚未实现，不能过早宣称 DBO 已带来稳定收益
+
+当前关键事实：
+1. vllm-ascend 当前工作分支：dbo-dev
+2. vllm 当前对齐目标：v0.18.0（注意这是 tag / 固定版本点）
+3. 当前实现仍是顺序双执行，不是异步重叠
+4. 真正 overlap 仍需要后续在 MoE / 通信路径补齐 hook 与 Ascend-native 方案
+
+-------------------------------------------------------------------------
+A. 本轮直接执行事项
+-------------------------------------------------------------------------
+
+A1. 先修同步脚本路径
+1. 本地脚本 sync_to_a3.ps1 中：
+   $LOCAL_BASE = "e:\codevllm\vllm-ascend"
+2. 该路径与当前实际工作区不一致。
+3. 学生接手后的第一件事：
+   - 改成当前真实路径，例如：
+     E:\code\codevllm\vllm-ascend
+4. 如果这一步不改，后续本地代码不会被正确同步到 A3。
+
+A2. 代码修改范围先不要扩散
+本轮只允许优先修改：
+1. vllm-ascend/vllm_ascend/platform.py
+2. vllm-ascend/vllm_ascend/worker/worker.py
+3. vllm-ascend/vllm_ascend/worker/model_runner_v1.py
+
+A3. 本轮代码目标
+1. 保持 Ascend 能稳定接受并运行 DBO 参数
+2. 保持 DP>1 下顺序 ubatch 路径稳定
+3. 日志中明确说明：
+   - 当前只是 sequential dual-execution
+   - 当前不代表真正 overlap
+   - MoE + no EP / GDN 等场景的限制条件
+4. 不在本轮尝试引入新的 DeepEP / EP 实现
+
+A4. 本轮脚本目标
+现有脚本可直接复用：
+1. start_dp2_tp2_nodbo.sh
+2. start_dp2_tp2_dbo.sh
+3. start_dp2_tp2_dbo_t1.sh
+4. start_dp2_tp2_dbo_t128.sh
+5. start_moe_dbo.sh
+6. start_moe_nodbo_local.sh
+7. bench_vllm.py
+8. scripts/bench_openai_completions.py
+9. scripts/compare_bench_output_tps.py
+
+本轮需要补的脚本：
+1. start_dp2_tp2_dbo_t64.sh
+2. start_dp2_tp2_dbo_t256.sh
+
+脚本要求：
+1. 端口继续沿用现有约定，不要随意改
+2. 模型、DP/TP、threshold 命名要与输出文件一致
+3. bench 结果统一写入 bench_results/日期目录/
+
+-------------------------------------------------------------------------
+B. A3 服务器标准执行步骤
+-------------------------------------------------------------------------
+
+B1. 本地改代码
+1. 在本地修改 vllm-ascend 代码
+2. 仅改本轮允许的少数文件
+
+B2. 同步到 A3
+1. 在 Windows 工作区执行：
+   .\sync_to_a3.ps1
+2. 确认 scp 成功
+3. 确认 docker cp 成功
+
+B3. 进入容器
+1. ssh 到 A3 主机
+2. 进入容器：
+   docker exec -it vllm-a3 bash
+
+B4. 启动服务前检查
+1. 确认目标端口未被旧进程占用
+2. 确认使用的模型路径存在
+3. 确认本次运行的脚本、模型、端口与记录一致
+
+B5. 启动服务
+1. Dense baseline：
+   bash /root/code/codevllm/start_dp2_tp2_nodbo.sh
+2. Dense DBO threshold=32：
+   bash /root/code/codevllm/start_dp2_tp2_dbo.sh
+3. Dense DBO threshold=1：
+   bash /root/code/codevllm/start_dp2_tp2_dbo_t1.sh
+4. Dense DBO threshold=128：
+   bash /root/code/codevllm/start_dp2_tp2_dbo_t128.sh
+5. 后续补上 threshold=64 / 256 后继续按同样方式启动
+
+B6. 启动后先做 smoke test
+1. 不允许服务启动后直接做大规模 bench
+2. 先执行：
+   curl http://127.0.0.1:8002/v1/completions \
+     -H "Content-Type: application/json" \
+     -d '{"model":"qwen3.5","prompt":"Hello","max_tokens":32}'
+3. 只有在 curl 返回正确结果后，才进入 benchmark
+
+-------------------------------------------------------------------------
+C. 本轮验证任务
+-------------------------------------------------------------------------
+
+C1. Dense 功能验证（优先级最高）
+目标：
+1. 验证 DBO off / on 都能稳定启动
+2. 验证 DBO on 在 DP=2, TP=2 下可稳定返回结果
+3. 验证不同 threshold 不会导致明显功能回退
+
+执行顺序：
+1. start_dp2_tp2_nodbo.sh
+2. start_dp2_tp2_dbo_t1.sh
+3. start_dp2_tp2_dbo.sh
+4. start_dp2_tp2_dbo_t64.sh
+5. start_dp2_tp2_dbo_t128.sh
+6. start_dp2_tp2_dbo_t256.sh
+
+每次记录：
+1. 是否启动成功
+2. 首次请求是否成功
+3. 日志中是否出现与 DBO / ubatch 相关的预期信息
+4. 是否出现异常 warning / assert / hang
+
+C2. Dense benchmark（本轮核心产出）
+推荐统一参数：
+1. base-url: http://127.0.0.1:8002
+2. model: qwen3.5
+3. max-tokens: 128
+4. concurrency: 8,16,32
+5. requests-per-level: 100
+6. warmup-rounds: 1
+7. repeats: 3
+
+推荐命令模板：
+python /root/code/codevllm/scripts/bench_openai_completions.py \
+  --base-url http://127.0.0.1:8002 \
+  --model qwen3.5 \
+  --max-tokens 128 \
+  --concurrency 8,16,32 \
+  --requests-per-level 100 \
+  --warmup-rounds 1 \
+  --repeats 3 \
+  --label dp2_tp2_dbo_t32 \
+  --output-json /root/code/codevllm/bench_results/2026-04-phase1/dp2_tp2_dbo_t32.json
+
+至少产出以下文件：
+1. dp2_tp2_nodbo.json
+2. dp2_tp2_dbo_t1.json
+3. dp2_tp2_dbo_t32.json
+4. dp2_tp2_dbo_t64.json
+5. dp2_tp2_dbo_t128.json
+6. dp2_tp2_dbo_t256.json
+
+对比命令模板：
+python /root/code/codevllm/scripts/compare_bench_output_tps.py \
+  --baseline /root/code/codevllm/bench_results/2026-04-phase1/dp2_tp2_nodbo.json \
+  --optimized /root/code/codevllm/bench_results/2026-04-phase1/dp2_tp2_dbo_t32.json \
+  --output /root/code/codevllm/bench_results/2026-04-phase1/compare_nodbo_vs_t32.md
+
+C3. MoE 机制验证（本轮只做机制，不做性能结论）
+目标：
+1. 验证 MoE + DBO without EP 可启动
+2. 验证日志中的 warning 与当前设计一致
+3. 验证 same-hardware 下 DBO on / off 行为稳定
+
+执行顺序：
+1. bash /root/code/codevllm/start_moe_dbo.sh
+2. bash /root/code/codevllm/start_moe_nodbo_local.sh
+
+验证点：
+1. 是否稳定启动
+2. 首次请求是否成功
+3. 日志是否说明当前没有 EP overlap
+4. 是否触发 GDN guard / no-op 路径
+
+注意：
+1. 当前不要把 MoE 结果写成“DBO 已优化 MoE 性能”
+2. 本轮只允许写成“机制验证通过 / 未通过”
+
+-------------------------------------------------------------------------
+D. 本轮交付物
+-------------------------------------------------------------------------
+
+学生本轮必须交付：
+1. 修改后的脚本清单
+2. Dense 各 threshold 的原始 JSON bench 结果
+3. DBO off vs on 的 markdown 对比表
+4. 简短实验结论（不超过 1 页）
+5. 追加到本文件的实验记录
+
+实验结论必须回答：
+1. 哪些配置能稳定启动
+2. 哪些 threshold 明显不值得继续测
+3. 当前 DBO 在 Ascend 上的准确语义是什么
+4. 当前有哪些场景仍只是 no-op / sequential path
+
+-------------------------------------------------------------------------
+E. 后面几轮目标与大概步骤
+-------------------------------------------------------------------------
+
+### 第 2 轮：Dense 路径收敛与阈值筛选
+目标：
+1. 找到 Dense DP=2, TP=2 下最值得保留的 2-3 个 threshold
+2. 清理无价值脚本与重复实验
+3. 固化 benchmark 方法
+
+步骤：
+1. 复查本轮 bench 数据
+2. 淘汰明显差的 threshold
+3. 增加更大请求量的复测，例如 requests-per-level=200
+4. 固定最终的 benchmark 参数模板
+5. 补一份“Dense DBO 使用说明”
+
+产出：
+1. 最终 Dense threshold shortlist
+2. 固定 benchmark 命令模板
+3. 一版干净的 Dense 结论摘要
+
+### 第 3 轮：MoE 场景机制确认
+目标：
+1. 确认当前 MoE 场景下哪些模型会被 GDN guard 禁止 ubatch
+2. 确认哪些 MoE 场景只是 no-op
+3. 把 MoE 当前限制写清楚
+
+步骤：
+1. 用现有脚本重复 MoE on / off 验证
+2. 查模型结构中是否存在 linear_attention / GDN
+3. 补日志，明确说明 no-op 原因
+4. 整理成“MoE 当前限制表”
+
+产出：
+1. MoE 可用性矩阵
+2. GDN / no-op 说明文档
+3. 是否值得继续追 MoE 性能的判断
+
+### 第 4 轮：真正 overlap 的设计预研
+目标：
+1. 不急着实现，先把未来技术路线讲清楚
+2. 判断是参考 vllm-ascend issue #5591 / PR #4894 为主，
+   还是参考 sgl-kernel-npu 的 Ascend DeepEP 为主
+
+相关线索与链接：
+1. 当前 dbo-dev 最新提交注释已经明确：
+   现在只是 sequential dual-execution，还没有做 async overlap；
+   真正的 overlap 还需要后续补齐 DBO / DeepEP 相关能力。
+2. Ascend 侧可参考的 DeepEP 实现：
+   https://github.com/sgl-project/sgl-kernel-npu/tree/main/python/deep_ep
+   备注：
+   - 这是 sglang-npu / sgl-kernel-npu 中的 Ascend DeepEP 实现
+   - 后续如果要做真正 overlap，可以重点研究它的 dispatch / combine /
+     low-latency 路径是否能为 vllm-ascend 复用
+3. vllm-ascend 社区已有 DBO 相关讨论：
+   https://github.com/vllm-project/vllm-ascend/issues/5591
+   备注：
+   - 该 issue 可以作为后续设计对齐和 upstream 叙事入口
+   - 注意：issue 的 Development 区当前显示“无关联 branches / pull requests”
+   - 但 issue 正文中明确提到了一个已有 PR：
+     https://github.com/vllm-project/vllm-ascend/pull/4894
+   - 因此更准确的说法是：
+     issue 本身没有挂 Development 关联，但正文引用了一个可读的历史 PR
+4. MindIE 文档可作为 Ascend 平台侧的外部设计参考：
+   https://www.hiascend.com/document/detail/zh/mindie/230/mindiellm/llmdev/mindie_llm0510.html
+   备注：
+   - 该公开页面可作为“Ascend 平台已存在 Micro Batch / DBO 类能力”的外部证据
+   - 适合用于解释为什么后续要追求双流 / 事件同步 / overlap 路线
+   - 但它不是可直接搬运的源码实现
+
+步骤：
+1. 阅读社区 issue / PR 方案
+   - 主入口：
+     https://github.com/vllm-project/vllm-ascend/issues/5591
+   - 历史 PR：
+     https://github.com/vllm-project/vllm-ascend/pull/4894
+   - 阅读时要明确区分：
+     a. issue 是社区背景与动机
+     b. PR #4894 是历史实现样例
+     c. 当前主线不一定直接复用该 PR 代码
+2. 比较当前 dbo-dev 与旧方案的 model_runner 差异
+   - 当前 dbo-dev 本地实现：顺序双执行
+   - 对比重点：
+     a. ubatch 调度入口
+     b. model_runner 内部控制流
+     c. comm hook / stream / event 插入点
+3. 列出真正 overlap 需要补的最小 hook 点
+   - 参考：
+     https://github.com/sgl-project/sgl-kernel-npu/tree/main/python/deep_ep
+   - 重点关注：
+     a. dispatch
+     b. combine
+     c. low-latency all-to-all
+     d. forward 中的 yield / wait / event 组织方式
+4. 明确是否必须引入 Ascend-native all2all / dispatch / combine 能力
+   - 参考：
+     https://www.hiascend.com/document/detail/zh/mindie/230/mindiellm/llmdev/mindie_llm0510.html
+   - 需要回答：
+     a. 只靠当前 sequential dual-execution 能否得到真实收益
+     b. 是否必须补齐 Ascend-native 通信与算子能力
+     c. 是否需要专门的 Ascend DeepEP / DeepEP-like backend
+
+当前建议的第 4 轮主线：
+1. 设计参考优先级建议改为：
+   - 第一参考：sglang / sgl-kernel-npu 的 Ascend DeepEP 实现
+   - 第二参考：MindIE 的双流 micro-batch / event 同步设计思路
+   - 第三参考：vllm-ascend issue #5591 与 PR #4894 的社区实现经验
+2. 原因：
+   - 当前本地 dbo-dev 已经能说明“顺序双执行”这一层
+   - 下一阶段真正缺的是 Ascend-native overlap 机制
+   - sglang DeepEP 更像底层能力参考
+   - MindIE 更像平台级设计参考
+   - issue / PR 更适合帮助理解社区里已经有人如何组织 model_runner / hooks / benchmark
+3. 对学生的执行建议：
+   - 不要把第 4 轮目标写成“复现 PR #4894”
+   - 应写成“结合 sglang DeepEP 与 MindIE 设计，评估如何在 vllm dbo 框架内实现 Ascend overlap”
+
+产出：
+1. 一份 design note
+2. 一份 TODO checklist
+3. MVP 范围定义（只做 MoE / 只做 Prefill / 只做 DP>1+EP 等）
+
+### 第 5 轮：overlap MVP 实现
+目标：
+1. 只做最小可验证版本
+2. 先拿到第一组“有真实价值”的重叠证据
+
+建议范围：
+1. 优先 MoE
+2. 优先 Prefill
+3. 优先最小并行组合
+4. 不追求第一版覆盖所有模型
+
+步骤：
+1. 实现最小 hook
+2. 跑功能验证
+3. 跑机制验证
+4. 跑小规模性能对比
+5. 如果收益不存在，先回到设计层复盘
+
+产出：
+1. MVP patch
+2. 对应 bench 数据
+3. 是否继续扩展的 go / no-go 结论
+
+### 第 6 轮：上游 PR 准备
+目标：
+1. 把最终故事拆清楚，降低 review 成本
+2. 不把“功能支持”和“性能优化”混成一个大 PR
+
+建议拆法：
+1. PR1：Ascend 支持 DBO 参数、guard、warning、基础验证
+2. PR2：真正 overlap / 性能优化
+
+步骤：
+1. 清理 debug 日志
+2. 整理 commit 历史
+3. 准备 benchmark 说明
+4. 准备限制项与 future work
+5. 向 vllm-ascend 提交 clean PR
+
+-------------------------------------------------------------------------
+F. 当前阶段不要做的事
+-------------------------------------------------------------------------
+
+1. 不要根据 DP=1 结果下结论
+2. 不要把顺序双执行描述成真正 overlap
+3. 不要直接搬运 DeepEP 代码到当前分支
+4. 不要在本轮尝试把 EP + DBO 一次性打通
+5. 不要扩大修改面到太多文件
+
+-------------------------------------------------------------------------
+G. 当前阶段一句话总结
+-------------------------------------------------------------------------
+
+当前 dbo-dev 已完成“Ascend 上 DBO 参数接入 + 部分 DP>1 顺序 ubatch 路径打通”，
+但“真正通信计算重叠”仍属于后续阶段目标；近期工作的重点是把功能、验证、
+benchmark 和限制项讲清楚并做扎实。

@@ -6,3 +6,7 @@
 	path = vllm-ascend
 	url = https://github.com/naliazheli/vllm-ascend.git
 	branch = dbo-dev
+[submodule "sgl-kernel-npu"]
+	path = sgl-kernel-npu
+	url = https://github.com/sgl-project/sgl-kernel-npu.git
+	branch = main
